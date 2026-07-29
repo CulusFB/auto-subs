@@ -1,0 +1,114 @@
+name: Build AutoSubs for Windows (fork)
+
+# Fork-only build. Upstream packages Windows manually (see
+# AutoSubs-App/scripts/upload-windows-artifacts.ps1), so this workflow exists
+# to produce an unsigned installer from a branch without a code-signing cert.
+#
+# Triggered by pushes to the integration branch rather than only by
+# workflow_dispatch: dispatch requires the workflow file to exist on the
+# default branch, and main is kept as a clean mirror of upstream so the
+# feature branches stay rebaseable.
+on:
+  push:
+    branches:
+      - ci/windows-build
+  workflow_dispatch:
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    env:
+      # The Vulkan shader build generates deeply nested paths that exceed
+      # Windows' 260-character limit, so keep the target dir short.
+      CARGO_TARGET_DIR: C:\ct
+
+    steps:
+      - name: Checkout AutoSubs Repo Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: AutoSubs-App/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: AutoSubs-App/src-tauri
+
+      # whisper-rs-sys reads VULKAN_SDK at build time. Chocolatey sets it at
+      # machine scope, which the already-running step does not inherit, so it
+      # is resolved explicitly and forwarded through GITHUB_ENV.
+      - name: Install LLVM and Vulkan SDK
+        run: |
+          choco install llvm vulkan-sdk -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+          $sdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
+          if (-not $sdk -or -not (Test-Path $sdk)) {
+            $sdk = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $sdk) { Write-Error "Vulkan SDK not found after install"; exit 1 }
+
+          Write-Host "VULKAN_SDK=$sdk"
+          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          echo "$sdk\Bin" >> $env:GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefix AutoSubs-App
+          npm ci --prefix Adobe-Extension
+
+      # tauri.windows.conf.json bundles binaries/ffmpeg as a sidecar, but the
+      # binary itself is gitignored (upstream builds Windows on a workstation
+      # that already has it), so fetch a static build here.
+      - name: Fetch ffmpeg sidecar
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg" -Force
+
+          $exe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe |
+            Select-Object -First 1
+          if (-not $exe) { Write-Error "ffmpeg.exe not found in archive"; exit 1 }
+
+          New-Item -ItemType Directory -Force -Path AutoSubs-App\src-tauri\binaries | Out-Null
+          Copy-Item $exe.FullName AutoSubs-App\src-tauri\binaries\ffmpeg-x86_64-pc-windows-msvc.exe
+          & AutoSubs-App\src-tauri\binaries\ffmpeg-x86_64-pc-windows-msvc.exe -version | Select-Object -First 1
+
+      # Upstream's tauri.conf.json pins the maintainer's code-signing cert and
+      # emits updater artifacts, both of which need secrets a fork does not
+      # have. Override just those fields; `build:win` is bypassed because it
+      # wraps tauri in dotenv-cli for the updater signing key.
+      - name: Build
+        working-directory: AutoSubs-App
+        run: |
+          @'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false,
+              "windows": {
+                "certificateThumbprint": null,
+                "timestampUrl": null,
+                "signCommand": null
+              }
+            }
+          }
+          '@ | Out-File -Encoding utf8 fork.conf.json
+          # The second `--` forwards the cargo flags through tauri, mirroring
+          # the double separator in the build:win script.
+          npm run tauri -- build --config fork.conf.json -- --no-default-features --features windows
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: autosubs-windows-nsis
+          path: C:\ct\release\bundle\nsis\*.exe
+          if-no-files-found: error
